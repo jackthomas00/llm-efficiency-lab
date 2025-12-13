@@ -1,6 +1,9 @@
 setup:
 	pip install -e .
 
+dev:
+	pip install -e .[dev]
+
 serve:
 	python -m efflab.engine.server_fastapi
 

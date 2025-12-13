@@ -9,3 +9,6 @@ benchmarks/results/
 *.bin
 *.safetensors
 .ipynb_checkpoints/
+*.egg-info/
+dist/
+build/
