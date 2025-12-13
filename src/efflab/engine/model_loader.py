@@ -18,7 +18,7 @@ def load_model_and_tokenizer(cfg: ModelConfig):
         tokenizer.pad_token = tokenizer.eos_token
 
     dtype = _dtype_from_str(cfg.dtype)
-    model = AutoModelForCausalLM.from_pretrained(cfg.model_id, torch_dtype=dtype)
+    model = AutoModelForCausalLM.from_pretrained(cfg.model_id, dtype=dtype)
     model.eval()
 
     if cfg.device == "cuda" and torch.cuda.is_available():
