@@ -1,0 +1,23 @@
+[project]
+name = "efflab"
+version = "0.1.0"
+description = "LLM efficiency experiments"
+requires-python = ">=3.10"
+
+dependencies = [
+  "torch",
+  "transformers",
+  "accelerate",
+  "fastapi",
+  "uvicorn",
+  "pydantic",
+  "numpy",
+  "matplotlib",
+  "psutil"
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
