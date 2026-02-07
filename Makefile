@@ -17,4 +17,4 @@ quantize:
 	python -m efflab.distill.quantize.bnb --bits 4
 
 test:
-	pytest -q
+	python -m pytest -q
