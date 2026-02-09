@@ -48,3 +48,13 @@ Model quality is plateauing.
 Efficiency is the bottleneck.
 
 This repo explores how real systems ship LLMs at scale.
+
+## Sample run
+```bash
+make serve
+# in another terminal:
+curl -s http://127.0.0.1:8000/health | jq
+curl -s -X POST http://127.0.0.1:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Write a 3-line haiku about caching. Use vivid imagery.\nHaiku:\n", "max_new_tokens":60}' | jq
+```

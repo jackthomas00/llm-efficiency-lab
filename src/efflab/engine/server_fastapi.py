@@ -15,7 +15,7 @@ runner = InferenceRunner(_model, _tok, _cfg.device)
 class GenerateRequest(BaseModel):
     prompt: str
     max_new_tokens: int = cfg.max_new_tokens_default
-    temperature: float = 0.0
+    temperature: float = 0.8
 
 @app.get("/health")
 def health():
@@ -28,7 +28,8 @@ def generate(req: GenerateRequest):
     text = runner.decode_text(dec["output_ids"])
 
     total_s = state["prefill_s"] + dec["decode_s"]
-    tps = (req.max_new_tokens / dec["decode_s"]) if dec["decode_s"] > 0 else None
+    gen_n = len(dec["new_token_ids"])
+    tps = (gen_n / dec["decode_s"]) if dec["decode_s"] > 0 else None
 
     return {
         "model": _cfg.model_id,
@@ -39,8 +40,15 @@ def generate(req: GenerateRequest):
             "total_s": total_s,
             "tokens_per_second": tps,
         },
+        "generation": {
+            "requested_new_tokens": req.max_new_tokens,
+            "generated_new_tokens": len(dec["new_token_ids"]),
+            "new_token_ids_preview": dec["new_token_ids"][:10],
+            "stopped_early": len(dec["new_token_ids"]) < req.max_new_tokens,
+        },
         "text": text,
     }
+
 
 if __name__ == "__main__":
     import uvicorn
