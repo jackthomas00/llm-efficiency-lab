@@ -76,10 +76,10 @@ class InferenceRunner:
         repetition_penalty: float,
         no_repeat_ngram_size: int,
     ):
-        # Decode with a baseline-aligned first step, then incremental cached steps.
-        prompt_ids = state["input_ids"]              # full prompt ids
-        attn = state["attention_mask"]               # may be None
-        past = None
+        # Decode using prefill output: past + last_logits. No re-forward of prompt.
+        prompt_ids = state["input_ids"]
+        attn = state["attention_mask"]
+        past = state["past_key_values"]
 
         t0 = time.perf_counter()
         generated = []
@@ -106,25 +106,20 @@ class InferenceRunner:
         cur_input = None
         for step in range(max_new_tokens):
             if step == 0:
-                out = self.model(
-                    input_ids=prompt_ids,
-                    attention_mask=attn,
-                    use_cache=True,
-                    return_dict=True,
-                )
+                logits = state["last_logits"]
             else:
                 assert cur_input is not None and cur_input.shape == (1, 1), (
                     "cached decode must feed only last token (1, 1)"
                 )
                 out = self.model(
-                    input_ids=cur_input,          # only last token
-                    attention_mask=attn,          # full-length mask (cheap)
-                    past_key_values=past,         # cache
+                    input_ids=cur_input,
+                    attention_mask=attn,
+                    past_key_values=past,
                     use_cache=True,
                     return_dict=True,
                 )
-            past = out.past_key_values
-            logits = out.logits[:, -1, :]
+                past = out.past_key_values
+                logits = out.logits[:, -1, :]
 
             history_ids = _history_ids_tensor()
             logits = _apply_repetition_penalty(logits, history_ids, repetition_penalty)
