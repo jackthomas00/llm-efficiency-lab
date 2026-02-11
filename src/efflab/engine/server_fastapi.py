@@ -16,6 +16,9 @@ class GenerateRequest(BaseModel):
     prompt: str
     max_new_tokens: int = cfg.max_new_tokens_default
     temperature: float = 0.8
+    repetition_penalty: float = 1.15
+    no_repeat_ngram_size: int = 3
+    use_kv_cache: bool = True
 
 @app.get("/health")
 def health():
@@ -23,13 +26,20 @@ def health():
 
 @app.post("/generate")
 def generate(req: GenerateRequest):
-    state = runner.prefill(req.prompt)
-    dec = runner.decode(state, max_new_tokens=req.max_new_tokens, temperature=req.temperature)
+    state = runner.prefill(req.prompt, use_kv_cache=req.use_kv_cache)
+    dec = runner.decode(
+        state,
+        max_new_tokens=req.max_new_tokens,
+        temperature=req.temperature,
+        repetition_penalty=req.repetition_penalty,
+        no_repeat_ngram_size=req.no_repeat_ngram_size,
+        use_kv_cache=req.use_kv_cache,
+    )
     text = runner.decode_text(dec["output_ids"])
 
     total_s = state["prefill_s"] + dec["decode_s"]
     gen_n = len(dec["new_token_ids"])
-    tps = (gen_n / dec["decode_s"]) if dec["decode_s"] > 0 else None
+    tps = (gen_n / total_s) if total_s > 0 else None # end-to-end TPS
 
     return {
         "model": _cfg.model_id,
@@ -42,9 +52,12 @@ def generate(req: GenerateRequest):
         },
         "generation": {
             "requested_new_tokens": req.max_new_tokens,
-            "generated_new_tokens": len(dec["new_token_ids"]),
+            "generated_new_tokens": gen_n,
             "new_token_ids_preview": dec["new_token_ids"][:10],
-            "stopped_early": len(dec["new_token_ids"]) < req.max_new_tokens,
+            "stopped_early": dec.get("stopped_early", gen_n < req.max_new_tokens),
+            "repetition_penalty": req.repetition_penalty,
+            "no_repeat_ngram_size": req.no_repeat_ngram_size,
+            "used_kv_cache": dec.get("used_kv_cache", req.use_kv_cache),
         },
         "text": text,
     }
@@ -53,4 +66,3 @@ def generate(req: GenerateRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("efflab.engine.server_fastapi:app", host="127.0.0.1", port=8000, reload=True)
-
