@@ -40,21 +40,22 @@ make setup
 make serve
 ```
 
+## Demos
+- Inference engine: `make serve`
+- Benchmarks: `make bench`
+- Distillation: `make distill`
+- Quantization: `make quantize`
+
+
 ---
 
 ## Philosophy
 
-Model quality is plateauing.
-Efficiency is the bottleneck.
+This repo focuses on **efficiency**—the bottleneck for shipping LLMs at scale. Whether you care about latency, throughput, memory, or cost, building real systems means getting the engineering right.
 
-This repo explores how real systems ship LLMs at scale.
+Here we explore how that works in practice.
 
-## Sample run
-```bash
-make serve
-# in another terminal:
-curl -s http://127.0.0.1:8000/health | jq
-curl -s -X POST http://127.0.0.1:8000/generate \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"Write a 3-line haiku about caching. Use vivid imagery.\nHaiku:\n", "max_new_tokens":60}' | jq
-```
+## Results (high level)
+- Throughoput vs batchsize: (graph)
+- Latency breakdown: (graph)
+- Accuracy vs bits: (graph)
