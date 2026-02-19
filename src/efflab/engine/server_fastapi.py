@@ -8,6 +8,8 @@ from efflab.engine.model_loader import load_model_and_tokenizer
 from efflab.engine.runner import InferenceRunner
 from efflab.engine.batcher import Batcher, WorkItem
 
+from contextlib import asynccontextmanager
+
 cfg = ModelConfig()
 _model, _tok, _cfg = load_model_and_tokenizer(cfg)
 runner = InferenceRunner(_model, _tok, _cfg.device)
@@ -21,8 +23,6 @@ class GenerateRequest(BaseModel):
     repetition_penalty: float = 1.15
     no_repeat_ngram_size: int = 3
     use_kv_cache: bool = True
-
-from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
