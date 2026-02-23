@@ -1,6 +1,9 @@
 from __future__ import annotations
 import asyncio
-from fastapi import FastAPI
+import json
+import time
+from fastapi import FastAPI, Request, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from efflab.common.config import ModelConfig
@@ -53,6 +56,60 @@ async def generate(req: GenerateRequest):
 
     await batcher.enqueue(work_item)
     return await future
+
+@app.post("/generate_stream")
+async def generate_stream(
+    req: GenerateRequest,
+    request: Request,
+    delay_ms: int = Query(0, description="Delay between tokens (ms) for testing streaming"),
+):
+    q: asyncio.Queue[dict] = asyncio.Queue()
+
+    work_item = WorkItem(
+        prompt=req.prompt,
+        max_new_tokens=req.max_new_tokens,
+        temperature=req.temperature,
+        repetition_penalty=req.repetition_penalty,
+        no_repeat_ngram_size=req.no_repeat_ngram_size,
+        use_kv_cache=req.use_kv_cache,
+        stream=True,
+        out_q=q,
+    )
+
+    await batcher.enqueue(work_item)
+
+    async def event_gen():
+        t0 = time.perf_counter()
+        try:
+            while True:
+                # Client disconnected?
+                if await request.is_disconnected():
+                    work_item.cancelled = True
+                    break
+
+                msg = await q.get()
+                typ = msg.get("type")
+                msg["ts"] = round(time.perf_counter() - t0, 4)
+
+                if typ == "token":
+                    if delay_ms > 0:
+                        await asyncio.sleep(delay_ms / 1000.0)
+                    yield f"event: token\ndata: {json.dumps(msg)}\n\n"
+                elif typ == "done":
+                    yield f"event: done\ndata: {json.dumps(msg)}\n\n"
+                    break
+                elif typ == "error":
+                    yield f"event: error\ndata: {json.dumps(msg)}\n\n"
+                    break
+                else:
+                    # Unknown message type, still forward it
+                    yield f"event: message\ndata: {json.dumps(msg)}\n\n"
+
+        except asyncio.CancelledError:
+            work_item.cancelled = True
+            raise
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 if __name__ == "__main__":
     import uvicorn

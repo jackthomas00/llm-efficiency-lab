@@ -255,6 +255,29 @@ class InferenceRunner:
         return results
 
     @torch.inference_mode()
+    def decode_step_batch_with_kv(self, *, last_ids, past, last_logits, attn_full, L0, step):
+        # If step == 0, we already have the last logits from prefill.
+        # For step >= 1, forward on last_ids with cur_attn slice.
+        if step > 0:
+            assert last_ids is not None, "last_ids must be set before step > 0"
+            cur_attn = None
+            if attn_full is not None:
+                assert L0 is not None, "L0 must be set before step > 0"
+                cur_attn = attn_full[:, : (L0 + step)]
+
+            out = self.model(
+                input_ids=last_ids, # [B, 1]
+                attention_mask=cur_attn,
+                past_key_values=past,
+                use_cache=True,
+                return_dict=True,
+            )
+            past = out.past_key_values
+            last_logits = out.logits[:, -1, :] # [B, vocab]
+
+        return past, last_logits
+
+    @torch.inference_mode()
     def decode(
         self,
         state,
@@ -413,6 +436,9 @@ class InferenceRunner:
 
     def decode_text(self, output_ids):
         return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+    def decode_token(self, token_id: int) -> str:
+        return self.tokenizer.decode([token_id], skip_special_tokens=False)
 
 
 def _sample_next_id(logits, temperature=0.8, top_p=0.95, top_k=50):
