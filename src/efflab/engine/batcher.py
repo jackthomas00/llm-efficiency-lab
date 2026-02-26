@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
-from collections import defaultdict
-from typing import Optional
+from dataclasses import dataclass, field
+from collections import defaultdict, deque
+from typing import Any, Optional
 
 import torch
 
@@ -27,6 +27,7 @@ class WorkItem:
     stream: bool = False
     out_q: asyncio.Queue | None = None # queue of dict messages (token/done/error)
     cancelled: bool = False
+    enqueued_at_s: float = field(default_factory=time.perf_counter)
 
 class Batcher:
     """
@@ -42,12 +43,22 @@ class Batcher:
         *,
         max_batch_size: int = 8,
         batch_timeout_ms: int = 10,
+        token_buckets: tuple[int, ...] = (32, 128),
+        max_queue_depth: int = 32,
+        enable_short_job_first: bool = True,
+        enable_round_robin: bool = True,
     ):
         self.runner = runner
         self.max_batch_size = max_batch_size
         self.batch_timeout_ms = batch_timeout_ms
+        self.token_buckets = tuple(sorted(token_buckets))
+        self.max_queue_depth = max_queue_depth
+        self.enable_short_job_first = enable_short_job_first
+        self.enable_round_robin = enable_round_robin
 
         self._q: asyncio.Queue[WorkItem] = asyncio.Queue()
+        self._bucketed_pending: dict[int, deque[WorkItem]] = defaultdict(deque)
+        self._rr_long_first = False
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
 
@@ -70,6 +81,86 @@ class Batcher:
 
     async def enqueue(self, item: WorkItem):
         await self._q.put(item)
+
+    def _bucket_for_tokens(self, max_new_tokens: int) -> int:
+        for upper in self.token_buckets:
+            if max_new_tokens <= upper:
+                return upper
+        # Sentinel bucket for "very long" jobs.
+        return 10**9
+
+    def _pending_depth(self) -> int:
+        return sum(len(bucket_q) for bucket_q in self._bucketed_pending.values())
+
+    async def _drain_incoming(self, *, block: bool, timeout_s: float | None = None) -> bool:
+        got_item = False
+        if block:
+            try:
+                if timeout_s is None:
+                    first = await self._q.get()
+                else:
+                    first = await asyncio.wait_for(self._q.get(), timeout=timeout_s)
+            except asyncio.TimeoutError:
+                return False
+            self._bucketed_pending[self._bucket_for_tokens(first.max_new_tokens)].append(first)
+            got_item = True
+
+        while True:
+            try:
+                nxt = self._q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._bucketed_pending[self._bucket_for_tokens(nxt.max_new_tokens)].append(nxt)
+            got_item = True
+        return got_item
+
+    def _pop_from_bucket(self, bucket: int) -> WorkItem | None:
+        bucket_q = self._bucketed_pending.get(bucket)
+        if not bucket_q:
+            return None
+        while bucket_q:
+            item = bucket_q.popleft()
+            if not self._item_cancelled(item):
+                if not bucket_q:
+                    del self._bucketed_pending[bucket]
+                return item
+        del self._bucketed_pending[bucket]
+        return None
+
+    def _select_batch_items(self) -> list[WorkItem]:
+        batch: list[WorkItem] = []
+        while len(batch) < self.max_batch_size:
+            non_empty = [bucket for bucket, q in self._bucketed_pending.items() if q]
+            if not non_empty:
+                break
+
+            non_empty.sort()
+            if not self.enable_short_job_first:
+                non_empty.reverse()
+
+            if self.enable_round_robin and len(non_empty) > 1:
+                if self._rr_long_first:
+                    order = list(reversed(non_empty))
+                else:
+                    order = non_empty
+            else:
+                order = non_empty
+
+            picked_any = False
+            for bucket in order:
+                item = self._pop_from_bucket(bucket)
+                if item is None:
+                    continue
+                batch.append(item)
+                picked_any = True
+                if len(batch) >= self.max_batch_size:
+                    break
+            if not picked_any:
+                break
+
+        if self.enable_round_robin and len(batch) > 0:
+            self._rr_long_first = not self._rr_long_first
+        return batch
 
     @staticmethod
     def _item_cancelled(item: WorkItem) -> bool:
@@ -95,10 +186,13 @@ class Batcher:
         temperature: float,
         repetition_penalty: float,
         no_repeat_ngram_size: int,
-    ) -> list[dict]:
+    ) -> tuple[list[dict], dict[str, list[float] | list[int]]]:
         t0 = time.perf_counter()
         batch_size = len(subgroup_states)
         eos_id = self.runner.tokenizer.eos_token_id
+        active_batch_size_per_decode_step: list[int] = []
+        tokens_generated_per_step: list[int] = []
+        time_per_decode_step: list[float] = []
 
         generated: list[list[int]] = [[] for _ in range(batch_size)]
         histories: list[list[int]] = [s["input_ids"][0].tolist() for s in subgroup_states]
@@ -134,6 +228,8 @@ class Batcher:
             if all(self._item_cancelled(subgroup_items[i]) for i in active_to_orig):
                 break
 
+            step_t0 = time.perf_counter()
+            active_batch_size_per_decode_step.append(len(active_to_orig))
             active_past, active_last_logits = self.runner.decode_step_batch_with_kv(
                 last_ids=active_last_ids,
                 past=active_past,
@@ -182,6 +278,10 @@ class Batcher:
                 alive_rows.append(active_i)
                 next_active_to_orig.append(orig_i)
 
+            step_t1 = time.perf_counter()
+            tokens_generated_per_step.append(len(next_ids))
+            time_per_decode_step.append(step_t1 - step_t0)
+
             if not next_active_to_orig:
                 break
 
@@ -224,30 +324,90 @@ class Batcher:
                     "used_kv_cache": True,
                 }
             )
-        return decs
+        return decs, {
+            "active_batch_size_per_decode_step": active_batch_size_per_decode_step,
+            "tokens_generated_per_step": tokens_generated_per_step,
+            "time_per_decode_step": time_per_decode_step,
+        }
 
-    async def _collect_batch(self) -> list[WorkItem]:
-        # Always block for 1 item
-        first = await self._q.get()
-        items = [first]
+    async def _collect_batch(self) -> tuple[list[WorkItem], float]:
+        formation_t0 = time.perf_counter()
+        # Always block for at least 1 item unless pending is already populated.
+        if self._pending_depth() == 0:
+            await self._drain_incoming(block=True)
 
-        # Then opportunistically gather more until timeout or max size
+        # Opportunistically gather more until timeout or queue-depth trigger.
         deadline = time.perf_counter() + (self.batch_timeout_ms / 1000.0)
-        while len(items) < self.max_batch_size:
+        while self._pending_depth() < self.max_batch_size:
+            if self._pending_depth() >= self.max_queue_depth:
+                break
             timeout = deadline - time.perf_counter()
             if timeout <= 0:
                 break
             try:
-                nxt = await asyncio.wait_for(self._q.get(), timeout=timeout)
-                items.append(nxt)
+                await self._drain_incoming(block=True, timeout_s=timeout)
             except asyncio.TimeoutError:
                 break
 
-        return items
+        formation_t1 = time.perf_counter()
+        return self._select_batch_items(), formation_t1 - formation_t0
+
+    def _set_result(
+        self,
+        *,
+        item: WorkItem,
+        state: dict[str, Any],
+        dec: dict[str, Any],
+        queue_wait_ms: float,
+        batch_size: int,
+        batch_formation_time: float,
+        active_batch_size_per_decode_step: list[int],
+        tokens_generated_per_step: list[int],
+        time_per_decode_step: list[float],
+    ):
+        text = self.runner.decode_text(dec["output_ids"])
+        total_s = state["prefill_s"] + dec["decode_s"]
+        gen_n = len(dec["new_token_ids"])
+        tps = (gen_n / total_s) if total_s > 0 else None
+        item.future.set_result({
+            "model": getattr(self.runner.model, "name_or_path", "unknown"),
+            "device": self.runner.device,
+            "timing": {
+                "prefill_s": state["prefill_s"],
+                "decode_s": dec["decode_s"],
+                "total_s": total_s,
+                "tokens_per_second": tps,
+            },
+            "generation": {
+                "requested_new_tokens": item.max_new_tokens,
+                "generated_new_tokens": gen_n,
+                "new_token_ids_preview": dec["new_token_ids"][:10],
+                "stopped_early": dec.get(
+                    "stopped_early",
+                    gen_n < item.max_new_tokens,
+                ),
+                "repetition_penalty": item.repetition_penalty,
+                "no_repeat_ngram_size": item.no_repeat_ngram_size,
+                "used_kv_cache": dec.get("used_kv_cache", item.use_kv_cache),
+            },
+            "batching": {
+                "queue_wait_ms": queue_wait_ms,
+                "batch_size": batch_size,
+                "active_batch_size_per_decode_step": active_batch_size_per_decode_step,
+                "tokens_generated_per_step": tokens_generated_per_step,
+                "time_per_decode_step": time_per_decode_step,
+                "batch_formation_time": batch_formation_time,
+            },
+            "text": text,
+        })
 
     async def _loop(self):
         while not self._stop.is_set():
-            batch = await self._collect_batch()
+            batch, batch_formation_time = await self._collect_batch()
+            if not batch:
+                continue
+            batch_dispatched_at_s = time.perf_counter()
+            collected_batch_size = len(batch)
 
             kv_items = [item for item in batch if item.use_kv_cache]
             base_items = [item for item in batch if not item.use_kv_cache]
@@ -283,7 +443,7 @@ class Batcher:
                         subgroup_states = [states[i] for i in idxs]
 
                         try:
-                            decs = await self._decode_kv_subgroup(
+                            decs, kv_step_metrics = await self._decode_kv_subgroup(
                                 subgroup_items,
                                 subgroup_states,
                                 max_new_tokens=max_new_tokens,
@@ -303,33 +463,21 @@ class Batcher:
                                 if item.stream:
                                     await self._publish_done(item)
                                 else:
-                                    text = self.runner.decode_text(dec["output_ids"])
-                                    total_s = state["prefill_s"] + dec["decode_s"]
-                                    gen_n = len(dec["new_token_ids"])
-                                    tps = (gen_n / total_s) if total_s > 0 else None
-                                    item.future.set_result({
-                                        "model": getattr(self.runner.model, "name_or_path", "unknown"),
-                                        "device": self.runner.device,
-                                        "timing": {
-                                            "prefill_s": state["prefill_s"],
-                                            "decode_s": dec["decode_s"],
-                                            "total_s": total_s,
-                                            "tokens_per_second": tps,
-                                        },
-                                        "generation": {
-                                            "requested_new_tokens": item.max_new_tokens,
-                                            "generated_new_tokens": gen_n,
-                                            "new_token_ids_preview": dec["new_token_ids"][:10],
-                                            "stopped_early": dec.get(
-                                                "stopped_early",
-                                                gen_n < item.max_new_tokens,
-                                            ),
-                                            "repetition_penalty": item.repetition_penalty,
-                                            "no_repeat_ngram_size": item.no_repeat_ngram_size,
-                                            "used_kv_cache": dec.get("used_kv_cache", item.use_kv_cache),
-                                        },
-                                        "text": text,
-                                    })
+                                    self._set_result(
+                                        item=item,
+                                        state=state,
+                                        dec=dec,
+                                        queue_wait_ms=(batch_dispatched_at_s - item.enqueued_at_s) * 1000.0,
+                                        batch_size=collected_batch_size,
+                                        batch_formation_time=batch_formation_time,
+                                        active_batch_size_per_decode_step=list(
+                                            kv_step_metrics["active_batch_size_per_decode_step"]
+                                        ),
+                                        tokens_generated_per_step=list(
+                                            kv_step_metrics["tokens_generated_per_step"]
+                                        ),
+                                        time_per_decode_step=list(kv_step_metrics["time_per_decode_step"]),
+                                    )
                             except Exception as e:
                                 await self._publish_error(item, e)
                 else:
@@ -346,11 +494,7 @@ class Batcher:
                                 no_repeat_ngram_size=item.no_repeat_ngram_size,
                                 use_kv_cache=item.use_kv_cache,
                             )
-                            text = self.runner.decode_text(dec["output_ids"])
-
-                            total_s = state["prefill_s"] + dec["decode_s"]
                             gen_n = len(dec["new_token_ids"])
-                            tps = (gen_n / total_s) if total_s > 0 else None
 
                             if item.stream and item.out_q is not None:
                                 for token_id in dec["new_token_ids"]:
@@ -363,25 +507,16 @@ class Batcher:
                                     )
                                 await self._publish_done(item)
                             else:
-                                item.future.set_result({
-                                    "model": getattr(self.runner.model, "name_or_path", "unknown"),
-                                    "device": self.runner.device,
-                                    "timing": {
-                                        "prefill_s": state["prefill_s"],
-                                        "decode_s": dec["decode_s"],
-                                        "total_s": total_s,
-                                        "tokens_per_second": tps,
-                                    },
-                                    "generation": {
-                                        "requested_new_tokens": item.max_new_tokens,
-                                        "generated_new_tokens": gen_n,
-                                        "new_token_ids_preview": dec["new_token_ids"][:10],
-                                        "stopped_early": dec.get("stopped_early", gen_n < item.max_new_tokens),
-                                        "repetition_penalty": item.repetition_penalty,
-                                        "no_repeat_ngram_size": item.no_repeat_ngram_size,
-                                        "used_kv_cache": dec.get("used_kv_cache", item.use_kv_cache),
-                                    },
-                                    "text": text,
-                                })
+                                self._set_result(
+                                    item=item,
+                                    state=state,
+                                    dec=dec,
+                                    queue_wait_ms=(batch_dispatched_at_s - item.enqueued_at_s) * 1000.0,
+                                    batch_size=collected_batch_size,
+                                    batch_formation_time=batch_formation_time,
+                                    active_batch_size_per_decode_step=[1],
+                                    tokens_generated_per_step=[gen_n],
+                                    time_per_decode_step=[dec["decode_s"]],
+                                )
                         except Exception as e:
                             await self._publish_error(item, e)
