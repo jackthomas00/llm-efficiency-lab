@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
+from transformers.cache_utils import DynamicCache
 
 from efflab.engine.runner import InferenceRunner
 
@@ -127,3 +128,77 @@ def test_kv_decode_regression_haiku_prompt():
 
     assert len(generated_baseline) == kv["tokens_generated"]
     assert torch.equal(output_ids_baseline, kv["output_ids"])
+
+
+class _BatchPruneModel(torch.nn.Module):
+    def __init__(self, vocab_size: int = 16):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.config = SimpleNamespace(max_position_embeddings=512)
+        self.forward_batch_sizes: list[int] = []
+        self.past_batch_sizes: list[int] = []
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask=None,
+        past_key_values=None,
+        use_cache=True,
+        return_dict=True,
+    ):
+        del attention_mask, use_cache, return_dict
+        batch, seq_len = input_ids.shape
+        self.forward_batch_sizes.append(batch)
+
+        prev_len = 0
+        if past_key_values is not None and hasattr(past_key_values, "layers"):
+            prev_len = past_key_values.layers[0].keys.shape[2]
+            self.past_batch_sizes.append(past_key_values.layers[0].keys.shape[0])
+
+        logits = torch.full((batch, seq_len, self.vocab_size), -1e9, device=input_ids.device)
+        logits[:, :, 0] = 0.0  # EOS at every decode step > 0
+
+        total_len = prev_len + seq_len
+        keys = torch.zeros((batch, 1, total_len, 1), device=input_ids.device)
+        values = torch.zeros((batch, 1, total_len, 1), device=input_ids.device)
+        return SimpleNamespace(logits=logits, past_key_values=DynamicCache(ddp_cache_data=[(keys, values)]))
+
+
+def _make_item_cache():
+    keys = torch.zeros((1, 1, 1, 1), dtype=torch.float32)
+    values = torch.zeros((1, 1, 1, 1), dtype=torch.float32)
+    return DynamicCache(ddp_cache_data=[(keys, values)])
+
+
+def test_decode_batch_with_kv_prunes_eos_and_shrinks_active_cache():
+    model = _BatchPruneModel()
+    tok = _ToyTokenizer()
+    runner = InferenceRunner(model, tok, device="cpu")
+
+    states = [
+        {
+            "input_ids": torch.tensor([[65]], dtype=torch.long),
+            "attention_mask": torch.tensor([[1]], dtype=torch.long),
+            "last_logits": torch.tensor([[0.0] + [-1e9] * 15], dtype=torch.float32),  # EOS immediately
+            "past_key_values": _make_item_cache(),
+        },
+        {
+            "input_ids": torch.tensor([[66]], dtype=torch.long),
+            "attention_mask": torch.tensor([[1]], dtype=torch.long),
+            "last_logits": torch.tensor([[-1e9, 0.0] + [-1e9] * 14], dtype=torch.float32),  # token 1
+            "past_key_values": _make_item_cache(),
+        },
+    ]
+
+    out = runner.decode_batch_with_kv(
+        states,
+        max_new_tokens=4,
+        temperature=0.0,
+        repetition_penalty=1.0,
+        no_repeat_ngram_size=0,
+    )
+
+    assert out[0]["tokens_generated"] == 0
+    assert out[1]["tokens_generated"] == 1
+    assert model.forward_batch_sizes == [1]
+    assert model.past_batch_sizes == [1]

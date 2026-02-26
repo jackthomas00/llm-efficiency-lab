@@ -11,6 +11,7 @@ import torch
 from efflab.engine.runner import InferenceRunner
 from efflab.engine.runner import _apply_no_repeat_ngram, _apply_repetition_penalty, _sample_next_id
 from efflab.engine.runner import _stack_past_key_values
+from efflab.engine.runner import _select_past_key_values_rows
 
 
 @dataclass
@@ -97,6 +98,7 @@ class Batcher:
     ) -> list[dict]:
         t0 = time.perf_counter()
         batch_size = len(subgroup_states)
+        eos_id = self.runner.tokenizer.eos_token_id
 
         generated: list[list[int]] = [[] for _ in range(batch_size)]
         histories: list[list[int]] = [s["input_ids"][0].tolist() for s in subgroup_states]
@@ -115,33 +117,46 @@ class Batcher:
             attn_full[:, :L0] = attn
 
         past = _stack_past_key_values([s["past_key_values"] for s in subgroup_states])
-        last_ids = None
+        active_to_orig = list(range(batch_size))
+        active_last_logits = last_logits
+        active_attn_full = attn_full
+        active_past = past
+        active_last_ids = None
 
         use_penalties = (repetition_penalty is not None and repetition_penalty > 1.0) or (
             no_repeat_ngram_size is not None and no_repeat_ngram_size > 1
         )
 
         for step in range(max_new_tokens):
-            if all(self._item_cancelled(item) for item in subgroup_items):
+            if not active_to_orig:
                 break
 
-            past, last_logits = self.runner.decode_step_batch_with_kv(
-                last_ids=last_ids,
-                past=past,
-                last_logits=last_logits,
-                attn_full=attn_full,
+            if all(self._item_cancelled(subgroup_items[i]) for i in active_to_orig):
+                break
+
+            active_past, active_last_logits = self.runner.decode_step_batch_with_kv(
+                last_ids=active_last_ids,
+                past=active_past,
+                last_logits=active_last_logits,
+                attn_full=active_attn_full,
                 L0=L0,
                 step=step,
             )
 
             next_ids: list[int] = []
-            for i in range(batch_size):
-                row_logits = last_logits[i : i + 1, :]
+            alive_rows: list[int] = []
+            next_active_to_orig: list[int] = []
+            for active_i, orig_i in enumerate(active_to_orig):
+                item = subgroup_items[orig_i]
+                if self._item_cancelled(item):
+                    continue
+
+                row_logits = active_last_logits[active_i : active_i + 1, :]
                 if use_penalties:
                     history_t = torch.tensor(
-                        [histories[i]],
+                        [histories[orig_i]],
                         device=row_logits.device,
-                        dtype=subgroup_states[i]["input_ids"].dtype,
+                        dtype=subgroup_states[orig_i]["input_ids"].dtype,
                     )
                     if repetition_penalty is not None and repetition_penalty > 1.0:
                         row_logits = _apply_repetition_penalty(row_logits, history_t, repetition_penalty)
@@ -149,12 +164,12 @@ class Batcher:
                         row_logits = _apply_no_repeat_ngram(row_logits, history_t, no_repeat_ngram_size)
 
                 next_id = _sample_next_id(row_logits, temperature=temperature, top_p=0.95)
-                next_ids.append(int(next_id.item()))
+                tok = int(next_id.item())
+                if eos_id is not None and tok == eos_id:
+                    continue
 
-            for i, tok in enumerate(next_ids):
-                generated[i].append(tok)
-                histories[i].append(tok)
-                item = subgroup_items[i]
+                generated[orig_i].append(tok)
+                histories[orig_i].append(tok)
                 if item.stream and item.out_q is not None and not self._item_cancelled(item):
                     await item.out_q.put(
                         {
@@ -163,12 +178,29 @@ class Batcher:
                             "text": self.runner.decode_token(tok),
                         }
                     )
+                next_ids.append(tok)
+                alive_rows.append(active_i)
+                next_active_to_orig.append(orig_i)
 
-            last_ids = torch.tensor(
+            if not next_active_to_orig:
+                break
+
+            active_last_ids = torch.tensor(
                 next_ids,
                 device=subgroup_states[0]["input_ids"].device,
                 dtype=subgroup_states[0]["input_ids"].dtype,
-            ).view(batch_size, 1)
+            ).view(len(next_ids), 1)
+
+            if len(next_active_to_orig) != len(active_to_orig):
+                alive_rows_t = torch.tensor(
+                    alive_rows,
+                    device=subgroup_states[0]["input_ids"].device,
+                    dtype=torch.long,
+                )
+                if active_attn_full is not None:
+                    active_attn_full = active_attn_full.index_select(0, alive_rows_t)
+                active_past = _select_past_key_values_rows(active_past, alive_rows_t)
+            active_to_orig = next_active_to_orig
 
         t1 = time.perf_counter()
         decode_s = t1 - t0

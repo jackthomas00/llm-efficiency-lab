@@ -144,32 +144,40 @@ class InferenceRunner:
 
         t0 = time.perf_counter()
         batch_size = len(states)
+        eos_id = self.tokenizer.eos_token_id
 
         # Per-request outputs (kept as Python lists for fast appends)
         generated: list[list[int]] = [[] for _ in range(batch_size)]
         histories: list[list[int]] = [s["input_ids"][0].tolist() for s in states]
 
         # Start from prefill-provided last logits
-        last_logits = torch.cat([s["last_logits"] for s in states], dim=0) # [B, vocab]
+        last_logits = torch.cat([s["last_logits"] for s in states], dim=0)  # [B, vocab]
 
         # Attention mask (note: in prefill_batch you keep full padded attn for KV)
-        attn = None
         attn_full = None
         L0 = None
         if states[0].get("attention_mask") is not None:
-            attn = torch.cat([s["attention_mask"] for s in states], dim=0) # [B, L]
+            attn = torch.cat([s["attention_mask"] for s in states], dim=0)  # [B, L]
 
             # attn is [B, L0] for the (padded) prompt length
             L0 = attn.shape[1]
             # Preallocate the full mask for prompt + max_new_tokens
-            attn_full = torch.ones((attn.shape[0], L0 + max_new_tokens), device=attn.device, dtype=attn.dtype)
+            attn_full = torch.ones(
+                (attn.shape[0], L0 + max_new_tokens),
+                device=attn.device,
+                dtype=attn.dtype,
+            )
             # Copy the prompt mask into the front
             attn_full[:, :L0] = attn
 
         past = _stack_past_key_values([s["past_key_values"] for s in states])
 
-        # Keep the "next input ids" as a tensor [B, 1] (avoids rebuilding from python lists each step)
-        last_ids = None # type: ignore
+        # Active rows are compacted as requests finish on EOS.
+        active_to_orig = list(range(batch_size))
+        active_last_logits = last_logits
+        active_attn_full = attn_full
+        active_past = past
+        active_last_ids = None  # type: ignore
 
         # Fast path: if penalites are off, skip expensive per-row history tensors
         use_penalties = (repetition_penalty is not None and repetition_penalty > 1.0) or (
@@ -177,37 +185,43 @@ class InferenceRunner:
         )
 
         for step in range(max_new_tokens):
+            if not active_to_orig:
+                break
+
+            active_batch_size = len(active_to_orig)
             # For step 0, we already have the last logits from prefill.
             # For step >= 1, run a single batched forward on the last sampled ids.
             if step > 0:
-                assert last_ids is not None and last_ids.shape == (batch_size, 1)
+                assert active_last_ids is not None and active_last_ids.shape == (active_batch_size, 1)
 
                 # For step > 0, we've already sampled `step` tokens, so total length is L0 + step
                 cur_attn = None
-                if attn_full is not None:
+                if active_attn_full is not None:
                     assert L0 is not None, "L0 must be set before step > 0"
-                    cur_attn = attn_full[:, : (L0 + step)]
+                    cur_attn = active_attn_full[:, : (L0 + step)]
 
                 out = self.model(
-                    input_ids=last_ids,
+                    input_ids=active_last_ids,
                     attention_mask=cur_attn,
-                    past_key_values=past,
+                    past_key_values=active_past,
                     use_cache=True,
                     return_dict=True,
                 )
-                past = out.past_key_values
-                last_logits = out.logits[:, -1, :] # [B, vocab]
+                active_past = out.past_key_values
+                active_last_logits = out.logits[:, -1, :]  # [B, vocab]
 
             # Sample next ids (still per-row because penalites/top-p are per-row here)
             next_ids: list[int] = []
-            for i in range(batch_size):
-                row_logits = last_logits[i : i + 1, :] # [1, vocab]
+            alive_rows: list[int] = []
+            next_active_to_orig: list[int] = []
+            for active_i, orig_i in enumerate(active_to_orig):
+                row_logits = active_last_logits[active_i : active_i + 1, :]  # [1, vocab]
 
                 if use_penalties:
                     history_t = torch.tensor(
-                        [histories[i]],
+                        [histories[orig_i]],
                         device=row_logits.device,
-                        dtype=states[i]["input_ids"].dtype,
+                        dtype=states[orig_i]["input_ids"].dtype,
                     )
                     if repetition_penalty is not None and repetition_penalty > 1.0:
                         row_logits = _apply_repetition_penalty(row_logits, history_t, repetition_penalty)
@@ -216,19 +230,35 @@ class InferenceRunner:
 
                 next_id = _sample_next_id(row_logits, temperature=temperature, top_p=0.95)
                 tok = int(next_id.item())
-                next_ids.append(tok)
+                if eos_id is not None and tok == eos_id:
+                    continue
 
-            # Update python histories + generated
-            for i, tok in enumerate(next_ids):
-                generated[i].append(tok)
-                histories[i].append(tok)
+                generated[orig_i].append(tok)
+                histories[orig_i].append(tok)
+                next_ids.append(tok)
+                alive_rows.append(active_i)
+                next_active_to_orig.append(orig_i)
+
+            if not next_active_to_orig:
+                break
 
             # Update last_ids tensor for the NEXT step's forward
-            last_ids = torch.tensor(
+            active_last_ids = torch.tensor(
                 next_ids,
                 device=states[0]["input_ids"].device,
                 dtype=states[0]["input_ids"].dtype,
-            ).view(batch_size, 1)
+            ).view(len(next_ids), 1)
+
+            if len(next_active_to_orig) != active_batch_size:
+                alive_rows_t = torch.tensor(
+                    alive_rows,
+                    device=states[0]["input_ids"].device,
+                    dtype=torch.long,
+                )
+                if active_attn_full is not None:
+                    active_attn_full = active_attn_full.index_select(0, alive_rows_t)
+                active_past = _select_past_key_values_rows(active_past, alive_rows_t)
+            active_to_orig = next_active_to_orig
 
         t1 = time.perf_counter()
         decode_s = t1 - t0
@@ -561,6 +591,35 @@ def _split_past_key_values(past_key_values, item_idx: int):
                 (
                     layer[0][item_idx : item_idx + 1, ...],
                     layer[1][item_idx : item_idx + 1, ...],
+                )
+            )
+        return DynamicCache(ddp_cache_data=ddp_cache_data)
+
+    return past_key_values
+
+
+def _select_past_key_values_rows(past_key_values, row_indices: torch.Tensor):
+    if past_key_values is None:
+        return None
+
+    if isinstance(past_key_values, Cache):
+        ddp_cache_data = []
+        for layer in past_key_values.layers:
+            ddp_cache_data.append(
+                (
+                    layer.keys.index_select(0, row_indices),
+                    layer.values.index_select(0, row_indices),
+                )
+            )
+        return DynamicCache(ddp_cache_data=ddp_cache_data)
+
+    if _is_legacy_kv_cache(past_key_values):
+        ddp_cache_data = []
+        for layer in past_key_values:
+            ddp_cache_data.append(
+                (
+                    layer[0].index_select(0, row_indices),
+                    layer[1].index_select(0, row_indices),
                 )
             )
         return DynamicCache(ddp_cache_data=ddp_cache_data)
